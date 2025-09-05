@@ -1787,16 +1787,19 @@ app.post("/api/items", authenticateToken, async (req, res) => {
 app.get("/api/items", async (req, res) => {
   try {
     const { category, search, page = 1, limit = 20 } = req.query
+    
     // First get active sellers
     const activeSellers = await User.find({
       userType: "seller",
       isActive: true,
     }).select("_id")
     const activeSellerIds = activeSellers.map((seller) => seller._id)
+    
     const query = {
       isAvailable: true,
       sellerId: { $in: activeSellerIds },
     }
+    
     if (category) {
       query.category = { $regex: category, $options: "i" }
     }
@@ -1807,11 +1810,15 @@ app.get("/api/items", async (req, res) => {
         { category: { $regex: search, $options: "i" } },
       ]
     }
+    
     const items = await Item.find(query)
+      .select('name description price category imageUrl quantity unit sellerId sellerName storeName discount tax hasVAT isAvailable createdAt updatedAt') // Added discount, tax, hasVAT
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit)
+    
     const total = await Item.countDocuments(query)
+    
     res.json({
       success: true,
       items,
@@ -1828,17 +1835,200 @@ app.get("/api/items", async (req, res) => {
   }
 })
 
-// Get Seller Items
+// 2. Update the admin get items endpoint
+app.get("/api/admin/items", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 100, category, search } = req.query;
+    
+    let query = {};
+    if (category && category !== 'all') {
+      query.category = category;
+    }
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    const items = await Item.find(query)
+      .select('name description price category imageUrl quantity unit sellerId sellerName storeName discount tax hasVAT isAvailable createdAt') // Added discount, tax, hasVAT
+      .sort({ createdAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+
+    const total = await Item.countDocuments(query);
+
+    res.json({
+      success: true,
+      items,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page,
+      total
+    });
+
+  } catch (error) {
+    console.error("Get items error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch items"
+    });
+  }
+});
+
+// 3. Update the admin-items public endpoint
+app.get("/api/admin-items", async (req, res) => {
+  try {
+    const { category, search, page = 1, limit = 20, status = "available" } = req.query
+    
+    // Query to find only admin-added items
+    const query = {
+      sellerName: "admin", // Items added by admin have sellerName as "admin"
+    }
+    
+    // By default, only show available items for public API
+    if (status === "available") {
+      query.isAvailable = true
+    } else if (status === "hidden") {
+      query.isAvailable = false
+    } else if (status === "all") {
+      // Don't filter by availability - show all admin items
+    } else {
+      // Default to available items
+      query.isAvailable = true
+    }
+    
+    // Filter by category
+    if (category) {
+      query.category = { $regex: category, $options: "i" }
+    }
+    
+    // Search functionality
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+        { category: { $regex: search, $options: "i" } },
+      ]
+    }
+
+    const items = await Item.find(query)
+      .select('name description price category imageUrl quantity unit sellerId sellerName storeName discount tax hasVAT isAvailable createdAt') // Added discount, tax, hasVAT
+      .sort({ createdAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+
+    const total = await Item.countDocuments(query)
+
+    res.json({
+      success: true,
+      items,
+      totalPages: Math.ceil(total / limit),
+      currentPage: parseInt(page),
+      totalItems: total,
+      message: "Admin items retrieved successfully"
+    })
+  } catch (error) {
+    console.error("Get admin items error:", error)
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch admin items",
+    })
+  }
+})
+
+// 4. Fix the admin add item endpoint to handle discount, tax, VAT properly
+app.post("/api/admin/items/json", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    console.log("JSON Request body:", req.body);
+
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const { 
+      name, 
+      description, 
+      price, 
+      category, 
+      quantity, 
+      unit, 
+      imageUrl,
+      discount = 0, 
+      tax = 0, 
+      hasVAT = false 
+    } = req.body;
+    
+    // Validate required fields
+    if (!name || !description || !price || !category || !quantity || !unit) {
+      return res.status(400).json({
+        success: false,
+        message: "All required fields must be provided",
+      });
+    }
+
+    console.log("Discount, Tax, VAT values:", { discount, tax, hasVAT });
+
+    // Create item with proper type conversion
+    const item = new Item({
+      name: name.trim(),
+      description: description.trim(),
+      price: parseFloat(price),
+      category: category.trim(),
+      imageUrl: imageUrl || '',
+      quantity: parseInt(quantity),
+      unit: unit.trim(),
+      sellerId: user._id,
+      sellerName: user.name,
+      storeName: user.storeName || user.name,
+      discount: parseFloat(discount) || 0,  // Ensure it's a number
+      tax: parseFloat(tax) || 0,           // Ensure it's a number
+      hasVAT: Boolean(hasVAT),             // Ensure it's a boolean
+      isAvailable: true,
+    });
+
+    const savedItem = await item.save();
+    console.log("Item saved with discount/tax/VAT:", {
+      discount: savedItem.discount,
+      tax: savedItem.tax,
+      hasVAT: savedItem.hasVAT
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Product added successfully by admin!",
+      item: savedItem,
+    });
+
+  } catch (error) {
+    console.error("Admin add item error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to add product. Please try again.",
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// 5. Update Get Seller Items to include discount, tax, VAT
 app.get("/api/items/my-items", authenticateToken, async (req, res) => {
   try {
     const user = await User.findById(req.user.id)
-    if ( user.userType !== "seller" && user.userType !== "admin") {
+    if (user.userType !== "seller" && user.userType !== "admin") {
       return res.status(403).json({
         success: false,
         message: "Only sellers can view their items",
       })
     }
-    const items = await Item.find({ sellerId: user._id }).sort({ createdAt: -1 })
+    
+    const items = await Item.find({ sellerId: user._id })
+      .select('name description price category imageUrl quantity unit sellerId sellerName storeName discount tax hasVAT isAvailable createdAt updatedAt') // Added discount, tax, hasVAT
+      .sort({ createdAt: -1 })
+    
     res.json({
       success: true,
       items,
@@ -1851,7 +2041,6 @@ app.get("/api/items/my-items", authenticateToken, async (req, res) => {
     })
   }
 })
-
 // Update Item
 app.put("/api/items/:id", authenticateToken, async (req, res) => {
   try {
